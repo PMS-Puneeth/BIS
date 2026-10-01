@@ -1,0 +1,269 @@
+"""
+Neural Architecture Search using ONLY a Genetic Algorithm
+(based on Algorithm 2 of "Optimizing ML and DNN by Genetic Algorithms", IAECST 2024)
+
+WHAT THE GA IS DOING HERE
+-------------------------
+We want the best MLP (number of hidden layers, neurons per layer, activation,
+solver, alpha, learning rate). Instead of testing a fixed grid, the GA:
+
+  1. keeps a POPULATION of candidate networks (each one is a "chromosome"),
+  2. scores each with cross-validated macro-F1  (FITNESS),
+  3. copies the best few unchanged                (ELITISM),
+  4. picks parents, favouring good ones           (SELECTION - roulette wheel),
+  5. mixes two parents' layer lists               (CROSSOVER),
+  6. randomly adds/removes/changes layers         (MUTATION),
+  7. repeats for many generations.
+
+Requirements: pip install numpy scikit-learn matplotlib
+Run:          python ga_architecture_search.py
+To use the Heart Disease data from the paper, save it as heart.csv (last column
+= target) in the same folder; otherwise a built-in sklearn dataset is used.
+"""
+import copy
+import os
+import random
+import warnings
+
+import matplotlib
+import numpy as np
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import cross_val_score, train_test_split
+from sklearn.metrics import f1_score
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import MinMaxScaler
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore")   # silence sklearn convergence warnings
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+
+# ----------------------------------------------------------------------------
+# GA settings (paper's defaults: elitism 0.1, crossover 0.7, mutation 0.2)
+# Smaller population/generations here so it runs in a minute or two.
+# ----------------------------------------------------------------------------
+POP_SIZE = 20
+GENERATIONS = 12
+ELITISM_RATE = 0.1
+CROSSOVER_RATE = 0.7
+MUTATION_RATE = 0.2
+
+# SEARCH SPACE: the "allowed designs". The GA can only produce things in here.
+LAYERS_RANGE = (1, 5)         # number of hidden layers
+NEURONS_RANGE = (5, 100)      # neurons per hidden layer
+ACTIVATIONS = ["tanh", "relu"]
+SOLVERS = ["adam", "sgd"]
+ALPHA_RANGE = (0.0001, 0.05)  # L2 regularization
+LR_RANGE = (0.001, 0.01)      # initial learning rate
+
+
+# ----------------------------------------------------------------------------
+# DATA
+# ----------------------------------------------------------------------------
+def load_data():
+    if os.path.exists("heart.csv"):
+        data = np.genfromtxt("heart.csv", delimiter=",", skip_header=1)
+        X, y = data[:, :-1], (data[:, -1] > 0).astype(int)
+        name = "Heart Disease (heart.csv)"
+    else:
+        X, y = load_breast_cancer(return_X_y=True)
+        name = "Breast Cancer (sklearn built-in)"
+    return X, y, name
+
+
+# ----------------------------------------------------------------------------
+# CHROMOSOME: one candidate network, stored as a plain dict.
+# Structural gene  -> "layers" (a variable-length list, e.g. [49, 15])
+# Other genes      -> activation, solver, alpha, lr
+# ----------------------------------------------------------------------------
+def random_chromosome():
+    """INITIALIZATION: random depth (1-5), random width per layer, random
+    hyperparameters. This gives the GA a diverse starting population."""
+    n_layers = random.randint(*LAYERS_RANGE)
+    return {
+        "layers": [random.randint(*NEURONS_RANGE) for _ in range(n_layers)],
+        "activation": random.choice(ACTIVATIONS),
+        "solver": random.choice(SOLVERS),
+        "alpha": random.uniform(*ALPHA_RANGE),
+        "lr": random.uniform(*LR_RANGE),
+    }
+
+
+def build_model(c):
+    """Turn a chromosome (genotype) into a real, trainable network (phenotype).
+    MinMaxScaler is inside the pipeline so it is fit only on training folds
+    (no data leakage during cross-validation)."""
+    mlp = MLPClassifier(
+        hidden_layer_sizes=tuple(c["layers"]),
+        activation=c["activation"],
+        solver=c["solver"],
+        alpha=c["alpha"],
+        learning_rate_init=c["lr"],
+        max_iter=300,
+        random_state=SEED,
+    )
+    return make_pipeline(MinMaxScaler(), mlp)
+
+
+# ----------------------------------------------------------------------------
+# FITNESS: how good is this architecture?  Mean 3-fold CV macro-F1 on TRAINING
+# data only. The test set is never touched during the search.
+# This is the ONLY signal that steers the whole evolution.
+# ----------------------------------------------------------------------------
+_cache = {}  # same chromosome => same score, so don't retrain it
+
+
+def fitness(c, X, y):
+    key = (tuple(c["layers"]), c["activation"], c["solver"],
+           round(c["alpha"], 6), round(c["lr"], 6))
+    if key not in _cache:
+        scores = cross_val_score(build_model(c), X, y, cv=3, scoring="f1_macro")
+        _cache[key] = scores.mean()
+    return _cache[key]
+
+
+# ----------------------------------------------------------------------------
+# SELECTION: roulette wheel. Probability of being picked is proportional to
+# fitness, so better networks become parents more often, but weaker ones keep
+# a small chance (this preserves diversity and avoids premature convergence).
+# ----------------------------------------------------------------------------
+def roulette_select(population, fits):
+    weights = np.array(fits) - min(fits) + 1e-6   # keep all weights positive
+    return random.choices(population, weights=weights, k=1)[0]
+
+
+# ----------------------------------------------------------------------------
+# CROSSOVER: custom operator from the paper.
+# Structural genes: pick a split point inside the SHORTER parent, then child =
+# parent1's layers before the split + parent2's layers after it.
+# The child's DEPTH can differ from both parents -> the GA changes the architecture.
+# Other hyperparameters: each is inherited from a random parent (50/50).
+#   P1 [48,22,50 | 60,40,70]   P2 [70,50,30 | 25,35,20]  ->  [48,22,50,25,35,20]
+# ----------------------------------------------------------------------------
+def crossover(p1, p2):
+    child = {}
+    if min(len(p1["layers"]), len(p2["layers"])) > 1:
+        split = random.randint(1, min(len(p1["layers"]), len(p2["layers"])) - 1)
+    else:
+        split = 1
+    layers = p1["layers"][:split] + p2["layers"][split:]
+    child["layers"] = layers[: LAYERS_RANGE[1]] or [random.randint(*NEURONS_RANGE)]
+    for gene in ("activation", "solver", "alpha", "lr"):
+        child[gene] = random.choice([p1[gene], p2[gene]])
+    return child
+
+
+# ----------------------------------------------------------------------------
+# MUTATION: random small changes that create designs nobody listed in advance.
+# Structural mutation (one of): add a layer / remove a layer / resize a layer.
+# Other hyperparameters are re-drawn within their allowed ranges.
+# ----------------------------------------------------------------------------
+def mutate(c):
+    c = copy.deepcopy(c)
+    move = random.choice(["add", "remove", "modify"])
+    if move == "add" and len(c["layers"]) < LAYERS_RANGE[1]:
+        c["layers"].insert(random.randint(0, len(c["layers"])),
+                           random.randint(*NEURONS_RANGE))
+    elif move == "remove" and len(c["layers"]) > LAYERS_RANGE[0]:
+        c["layers"].pop(random.randrange(len(c["layers"])))
+    else:  # modify (also the fallback when add/remove isn't allowed)
+        c["layers"][random.randrange(len(c["layers"]))] = random.randint(*NEURONS_RANGE)
+
+    # re-roll one non-structural hyperparameter
+    gene = random.choice(["activation", "solver", "alpha", "lr"])
+    if gene == "activation":
+        c["activation"] = random.choice(ACTIVATIONS)
+    elif gene == "solver":
+        c["solver"] = random.choice(SOLVERS)
+    elif gene == "alpha":
+        c["alpha"] = random.uniform(*ALPHA_RANGE)
+    else:
+        c["lr"] = random.uniform(*LR_RANGE)
+    return c
+
+
+# ----------------------------------------------------------------------------
+# THE GA LOOP (Algorithm 2 in the paper)
+# ----------------------------------------------------------------------------
+def run_ga(X, y):
+    n_elite = max(1, int(ELITISM_RATE * POP_SIZE))
+    population = [random_chromosome() for _ in range(POP_SIZE)]   # step 1: init
+    best_hist, mean_hist = [], []
+    best_overall, best_fit = None, -1
+
+    for gen in range(1, GENERATIONS + 1):
+        # step 2: evaluate fitness of every individual
+        fits = [fitness(c, X, y) for c in population]
+        order = np.argsort(fits)[::-1]
+        if fits[order[0]] > best_fit:
+            best_fit, best_overall = fits[order[0]], copy.deepcopy(population[order[0]])
+        best_hist.append(best_fit)
+        mean_hist.append(float(np.mean(fits)))
+        print(f"Gen {gen:2d} | best CV F1 = {best_fit:.4f} | "
+              f"pop mean = {np.mean(fits):.4f} | best layers = {best_overall['layers']}")
+
+        # step 3: ELITISM - top individuals pass unchanged (best is never lost)
+        new_pop = [copy.deepcopy(population[i]) for i in order[:n_elite]]
+
+        # steps 4-5: SELECTION + CROSSOVER fill the rest of the new generation
+        while len(new_pop) < POP_SIZE:
+            p1 = roulette_select(population, fits)
+            if random.random() < CROSSOVER_RATE:
+                p2 = roulette_select(population, fits)
+                child = crossover(p1, p2)
+            else:
+                child = copy.deepcopy(p1)                 # no crossover: clone parent
+            # step 6: MUTATION (never applied to elites)
+            if random.random() < MUTATION_RATE:
+                child = mutate(child)
+            new_pop.append(child)
+
+        population = new_pop                              # step 7: next generation
+
+    return best_overall, best_fit, best_hist, mean_hist
+
+
+# ----------------------------------------------------------------------------
+# MAIN: search on training data, then report on the untouched test set
+# ----------------------------------------------------------------------------
+if __name__ == "__main__":
+    X, y, name = load_data()
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=SEED, stratify=y)
+    print(f"Dataset: {name}  |  train={len(X_train)}  test={len(X_test)}\n")
+
+    best, best_cv, best_hist, mean_hist = run_ga(X_train, y_train)
+
+    # Compare with a default MLP so we can see whether the GA actually helped
+    default = make_pipeline(MinMaxScaler(), MLPClassifier(max_iter=300, random_state=SEED))
+    default.fit(X_train, y_train)
+    default_f1 = f1_score(y_test, default.predict(X_test), average="macro")
+
+    final = build_model(best).fit(X_train, y_train)
+    ga_f1 = f1_score(y_test, final.predict(X_test), average="macro")
+
+    print("\n=== BEST ARCHITECTURE FOUND BY GA ===")
+    print(f"hidden layers : {best['layers']}  ({len(best['layers'])} layers)")
+    print(f"activation    : {best['activation']}")
+    print(f"solver        : {best['solver']}")
+    print(f"alpha         : {best['alpha']:.5f}")
+    print(f"learning rate : {best['lr']:.5f}")
+    print(f"\nCV F1 (search, train data) : {best_cv:.4f}")
+    print(f"Test F1  default MLP       : {default_f1:.4f}")
+    print(f"Test F1  GA-found MLP      : {ga_f1:.4f}")
+    print(f"Networks trained during search: {len(_cache)}")
+
+    plt.figure(figsize=(6, 4))
+    plt.plot(range(1, GENERATIONS + 1), best_hist, marker="o", label="Best fitness")
+    plt.plot(range(1, GENERATIONS + 1), mean_hist, marker="s", label="Population mean")
+    plt.xlabel("Generation")
+    plt.ylabel("CV macro-F1")
+    plt.title("GA progress")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("ga_progress.png", dpi=130)
+    print("Saved plot to ga_progress.png")
