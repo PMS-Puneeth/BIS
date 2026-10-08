@@ -1,0 +1,114 @@
+import numpy as np
+import time
+from sklearn.datasets import load_digits
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import SelectKBest, mutual_info_classif
+from sklearn.svm import SVC
+
+np.random.seed(42)
+start = time.time()
+
+# ------------------------------------------------------------
+# PART 1: DATA + MI FILTER  (the paper's feature selection step)
+# ------------------------------------------------------------
+X, y = load_digits(return_X_y=True)                 # stand-in for fused CNN + handcrafted features
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y)
+
+scaler = StandardScaler().fit(X_train)
+X_train, X_test = scaler.transform(X_train), scaler.transform(X_test)
+
+mi = SelectKBest(mutual_info_classif, k=40).fit(X_train, y_train)   # keep top-40 informative features
+X_train, X_test = mi.transform(X_train), mi.transform(X_test)
+
+# ------------------------------------------------------------
+# PART 2: PSO SETTINGS
+# ------------------------------------------------------------
+N_PARTICLES = 8              # swarm size (small = fast)
+MAX_ITER    = 10             # number of iterations
+w, c1, c2   = 0.7, 1.5, 1.5  # inertia, cognitive (own best), social (swarm best)
+
+lb = np.array([1.0, 0.0001])     # lower bounds  [C, gamma]  (same as paper)
+ub = np.array([100.0, 1.0])      # upper bounds  [C, gamma]
+v_max = 0.2 * (ub - lb)          # velocity limit so particles don't jump too far
+
+# ------------------------------------------------------------
+# PART 3: FITNESS FUNCTION  (how good is one particle?)
+# A particle = [C, gamma]. Fitness = 3-fold CV accuracy of the SVM.
+# We return negative accuracy so that LOWER = BETTER (as in the paper's Algorithm 1).
+# ------------------------------------------------------------
+def fitness(params):
+    C, gamma = params
+    model = SVC(kernel="rbf", C=C, gamma=gamma)
+    acc = cross_val_score(model, X_train, y_train, cv=3, n_jobs=-1).mean()
+    return -acc
+
+# ------------------------------------------------------------
+# PART 4: INITIALIZE THE SWARM
+# ------------------------------------------------------------
+pos = np.random.uniform(lb, ub, (N_PARTICLES, 2))   # random starting [C, gamma] for each particle
+vel = np.zeros((N_PARTICLES, 2))                    # start with zero velocity (as in paper)
+
+pbest     = pos.copy()                              # each particle's best position so far
+pbest_fit = np.array([fitness(p) for p in pos])     # fitness of those positions
+
+g_idx     = np.argmin(pbest_fit)                    # which particle is best overall
+gbest     = pbest[g_idx].copy()                     # swarm's best position
+gbest_fit = pbest_fit[g_idx]                        # swarm's best fitness
+
+history = [-gbest_fit]                              # to track progress
+
+# ------------------------------------------------------------
+# PART 5: MAIN PSO LOOP
+# ------------------------------------------------------------
+for it in range(MAX_ITER):
+    for i in range(N_PARTICLES):
+
+        # --- (a) VELOCITY UPDATE: the heart of PSO ---
+        r1, r2 = np.random.rand(2), np.random.rand(2)   # random numbers add exploration
+        vel[i] = (w * vel[i]                            # keep moving in old direction (inertia)
+                  + c1 * r1 * (pbest[i] - pos[i])       # pull toward MY best position
+                  + c2 * r2 * (gbest - pos[i]))         # pull toward the SWARM's best position
+        vel[i] = np.clip(vel[i], -v_max, v_max)         # limit speed
+
+        # --- (b) POSITION UPDATE: move the particle ---
+        pos[i] = pos[i] + vel[i]
+        pos[i] = np.clip(pos[i], lb, ub)                # keep C and gamma inside bounds
+
+        # --- (c) EVALUATE the new position ---
+        fit = fitness(pos[i])
+
+        # --- (d) UPDATE PERSONAL BEST ---
+        if fit < pbest_fit[i]:
+            pbest[i], pbest_fit[i] = pos[i].copy(), fit
+
+        # --- (e) UPDATE GLOBAL BEST ---
+        if fit < gbest_fit:
+            gbest, gbest_fit = pos[i].copy(), fit
+
+    history.append(-gbest_fit)
+    print(f"Iter {it+1:2d}/{MAX_ITER} | best CV acc = {-gbest_fit:.4f} "
+          f"| C = {gbest[0]:.2f}, gamma = {gbest[1]:.5f}")
+
+# ------------------------------------------------------------
+# PART 6: FINAL MODEL WITH gbest + COMPARISON WITH DEFAULT SVM
+# ------------------------------------------------------------
+best_C, best_gamma = gbest
+final = SVC(kernel="rbf", C=best_C, gamma=best_gamma).fit(X_train, y_train)
+default = SVC().fit(X_train, y_train)
+
+print("\n--- RESULTS ---")
+print(f"Best params (PSO)   : C = {best_C:.3f}, gamma = {best_gamma:.5f}")
+print(f"Default SVM accuracy: {default.score(X_test, y_test):.4f}")
+print(f"PSO-tuned SVM       : {final.score(X_test, y_test):.4f}")
+print(f"Total time          : {time.time() - start:.1f} s")
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(6, 4))
+plt.plot(range(len(history)), history, marker="o")
+plt.xlabel("Iteration (0 = initial swarm)")
+plt.ylabel("Best CV accuracy (gbest)")
+plt.title("PSO convergence")
+plt.grid(True)
+plt.show()
