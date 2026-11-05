@@ -4,97 +4,95 @@ import matplotlib.pyplot as plt
 
 t0 = time.time()
 
-# ---------------- PART 1: BENCHMARK FUNCTIONS (minimise, optimum = 0) ----------------
-# The optimum is SHIFTED away from the origin. GWO is known to look good when the
-# optimum sits at the origin (its centre bias), so shifting gives a fairer test.
+# ---------------- PART 1: BENCHMARK FUNCTIONS (minimise, optimum = 0, SHIFTED off the origin) ----------------
 SHIFT = np.random.RandomState(7).uniform(-2, 2, 10)
-def sphere(x):    x = x - SHIFT; return np.sum(x**2)
-def rastrigin(x): x = x - SHIFT; return 10*len(x) + np.sum(x**2 - 10*np.cos(2*pi*x))
-def ackley(x):    x = x - SHIFT; return (-20*np.exp(-0.2*np.sqrt(np.mean(x**2)))
-                          - np.exp(np.mean(np.cos(2*pi*x))) + 20 + np.e)
+def sphere(x):     x = x - SHIFT; return np.sum(x**2)
+def rastrigin(x):  x = x - SHIFT; return 10*len(x) + np.sum(x**2 - 10*np.cos(2*pi*x))
+def ackley(x):     x = x - SHIFT; return (-20*np.exp(-0.2*np.sqrt(np.mean(x**2)))
+                                          - np.exp(np.mean(np.cos(2*pi*x))) + 20 + np.e)
 def rosenbrock(x): x = x - SHIFT + 1; return np.sum(100*(x[1:] - x[:-1]**2)**2 + (x[:-1] - 1)**2)
 FUNCS = {"Sphere": (sphere, 5.12), "Rastrigin": (rastrigin, 5.12),
          "Ackley": (ackley, 32.0), "Rosenbrock": (rosenbrock, 5.12)}
 
-D, N_WOLVES, MAX_ITER = 10, 25, 200
+D, N_WOLVES, MAX_ITER = 10, 24, 200
 
-def top3(pop, fit):
-    idx = np.argsort(fit)[:3]                       # alpha, beta, delta = 3 best wolves
-    return pop[idx].copy(), fit[idx].copy()
+def hunt(x, leaders, a, weights):
+    """GWO move of wolf x guided by 3 leaders (alpha, beta, delta)."""
+    X = np.zeros(D)
+    for L, w in zip(leaders, weights):
+        A = 2*a*np.random.rand(D) - a
+        C = 2*np.random.rand(D)
+        X += w * (L - A*np.abs(C*L - x))
+    return X
 
-# ---------------- PART 2: STANDARD GREY WOLF OPTIMIZER ----------------
+# ---------------- PART 2: STANDARD GWO (ONE pack) ----------------
 def standard_gwo(f, bound, seed):
     np.random.seed(seed)
-    pop = np.random.uniform(-bound, bound, (N_WOLVES, D))          # random start
+    pop = np.random.uniform(-bound, bound, (N_WOLVES, D))
     fit = np.array([f(p) for p in pop])
     hist = []
     for t in range(MAX_ITER):
-        leaders, _ = top3(pop, fit)                                 # alpha, beta, delta
-        a = 2 * (1 - t / MAX_ITER)                                  # linear decrease 2 -> 0
+        leaders = pop[np.argsort(fit)[:3]].copy()
+        a = 2 * (1 - t / MAX_ITER)
         for i in range(N_WOLVES):
-            X = np.zeros(D)
-            for L in leaders:                                       # move relative to each leader
-                A = 2*a*np.random.rand(D) - a                       # |A|>1 explore, |A|<1 attack
-                C = 2*np.random.rand(D)
-                X += (L - A*np.abs(C*L - pop[i])) / 3               # equal-weight average
-            pop[i] = np.clip(X, -bound, bound)
+            pop[i] = np.clip(hunt(pop[i], leaders, a, [1/3]*3), -bound, bound)
             fit[i] = f(pop[i])
         hist.append(fit.min())
     return hist
 
-# ---------------- PART 3: IMPROVED GWO (simplified multi-strategy fusion) ----------------
-def improved_gwo(f, bound, seed):
+# ---------------- PART 3: MULTI-SWARM GWO (simplified) ----------------
+def multi_swarm_gwo(f, bound, seed, n_swarms=4, regroup_every=10):
     np.random.seed(seed)
-    # (1) chaotic opposition-based initialization: logistic map + opposite points
-    z = np.random.rand(N_WOLVES, D)
-    for _ in range(20): z = 4 * z * (1 - z)                         # logistic chaos
-    chaos = -bound + 2*bound*z
-    opp = -chaos                                                    # opposite (backward) learning
-    both = np.vstack([chaos, opp])
-    bf = np.array([f(p) for p in both])
-    keep = np.argsort(bf)[:N_WOLVES]                                # keep the best half
-    pop, fit = both[keep].copy(), bf[keep].copy()
-    pbest, pbest_fit = pop.copy(), fit.copy()                       # individual memory
+    pop = np.random.uniform(-bound, bound, (N_WOLVES, D))
+    fit = np.array([f(p) for p in pop])
+    z = np.random.rand(N_WOLVES)                       # chaotic state, one value per wolf
+
+    def chaotic_grouping():
+        """(1) Chaotic grouping: logistic map decides which swarm each wolf joins."""
+        nonlocal z
+        for _ in range(5): z = 4 * z * (1 - z)
+        return np.array_split(np.argsort(z), n_swarms)
+
+    groups = chaotic_grouping()
     hist = []
     for t in range(MAX_ITER):
-        leaders, lfit = top3(pop, fit)
-        # (2) nonlinear control parameter (stays large longer -> more exploration, then drops fast)
-        a = 2 * np.cos(pi / 2 * t / MAX_ITER)
-        # (3) dynamic weights: alpha's weight grows over time (explore -> exploit)
-        w1 = 1/3 + (t / MAX_ITER) / 3
-        w = np.array([w1, (1 - w1) * 0.6, (1 - w1) * 0.4])
-        for i in range(N_WOLVES):
-            X = np.zeros(D)
-            for L, wk in zip(leaders, w):
-                A = 2*a*np.random.rand(D) - a
-                C = 2*np.random.rand(D)
-                X += wk * (L - A*np.abs(C*L - pop[i]))
-            X += 0.3 * np.random.rand() * (pbest[i] - pop[i])       # pull toward own best (memory)
-            pop[i] = np.clip(X, -bound, bound)
-            fit[i] = f(pop[i])
-            if fit[i] < pbest_fit[i]: pbest[i], pbest_fit[i] = pop[i].copy(), fit[i]
-        # (4) Gaussian-Cauchy mutation of alpha, keep it only if better (superior selection)
-        j = np.argmin(fit)
-        sigma = bound * 0.1 * (1 - t / MAX_ITER)
-        cand = pop[j] + 0.5*sigma*np.random.randn(D) + 0.5*sigma*np.random.standard_cauchy(D)
-        cand = np.clip(cand, -bound, bound)
-        fc = f(cand)
-        if fc < fit[j]: pop[j], fit[j] = cand, fc
+        if t > 0 and t % regroup_every == 0:           # (2) dynamic regrouping: reshuffle swarms
+            groups = chaotic_grouping()
+        a = 2 * (1 - (t / MAX_ITER)**2)                # nonlinear control parameter (slower decay)
+        r = t / MAX_ITER
+        w_swarm, w_global = 1 - 0.6*r, 0.6*r           # (3) double adaptive weights
+        g_alpha = pop[np.argmin(fit)].copy()           # global best wolf (shared across swarms)
+        new_pop, new_fit = pop.copy(), fit.copy()
+        for g in groups:                               # each swarm hunts with ITS OWN leaders
+            leaders = pop[g[np.argsort(fit[g])[:3]]].copy()
+            for i in g:
+                x_swarm  = hunt(pop[i], leaders, a, [1/3]*3)           # local swarm guidance
+                x_global = hunt(pop[i], [g_alpha]*3, a, [1/3]*3)       # global guidance
+                X = np.clip(w_swarm*x_swarm + w_global*x_global, -bound, bound)
+                fX = f(X)
+                # (4) dimension learning: build a rival from a swarm-mate and a random wolf
+                mate, rnd = np.random.choice(g), np.random.randint(N_WOLVES)
+                Y = np.clip(pop[i] + np.random.rand(D)*(pop[mate] - pop[rnd]), -bound, bound)
+                fY = f(Y)
+                best_x, best_f = (X, fX) if fX < fY else (Y, fY)       # keep the better candidate
+                new_pop[i], new_fit[i] = best_x, best_f
+        pop, fit = new_pop, new_fit
         hist.append(fit.min())
     return hist
 
 # ---------------- PART 4: RUN + COMPARE (5 runs each) ----------------
 RUNS = 5
 fig, axes = plt.subplots(1, 4, figsize=(17, 3.8))
-print(f"{'Function':11s} | {'Standard GWO':>13s} | {'Improved GWO':>13s}")
+print(f"{'Function':11s} | {'Standard GWO':>13s} | {'Multi-swarm GWO':>15s}")
 for ax, (name, (f, b)) in zip(axes, FUNCS.items()):
     std = np.array([standard_gwo(f, b, s) for s in range(RUNS)])
-    imp = np.array([improved_gwo(f, b, s) for s in range(RUNS)])
-    print(f"{name:11s} | {std[:, -1].mean():13.4e} | {imp[:, -1].mean():13.4e}")
+    ms  = np.array([multi_swarm_gwo(f, b, s) for s in range(RUNS)])
+    print(f"{name:11s} | {std[:, -1].mean():13.4e} | {ms[:, -1].mean():15.4e}")
     ax.semilogy(std.mean(0), label="Standard GWO")
-    ax.semilogy(imp.mean(0), label="Improved GWO")
+    ax.semilogy(ms.mean(0), label="Multi-swarm GWO")
     ax.set_title(name); ax.set_xlabel("Iteration"); ax.set_ylabel("Best fitness (log)")
     ax.grid(True); ax.legend(fontsize=7)
 print(f"Total time: {time.time()-t0:.1f} s")
 plt.tight_layout()
+plt.show()
 plt.show()
