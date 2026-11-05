@@ -1,0 +1,114 @@
+import numpy as np, random, time
+import matplotlib.pyplot as plt
+
+random.seed(3); np.random.seed(3)
+t0 = time.time()
+
+# ---------------- PART 1: ENVIRONMENT ----------------
+N = 20
+START, GOAL = (0, 0), (N - 1, N - 1)
+grid = np.zeros((N, N), int)                 # 1 = static obstacle
+grid[4:15, 6] = 1
+grid[12, 10:18] = 1
+grid[3, 2:9] = 1
+grid[8:11, 14] = 1
+MOVES = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]
+
+def free(p): return 0 <= p[0] < N and 0 <= p[1] < N and grid[p] == 0
+def dist(a, b): return np.hypot(a[0]-b[0], a[1]-b[1])
+
+# ---------------- PART 2: GLOBAL PLANNING WITH ACO ----------------
+ALPHA, BETA, RHO, Q = 1.0, 3.0, 0.3, 10.0
+N_ANTS, N_ITER = 20, 25
+tau = np.ones((N, N, 8))                      # pheromone on every (cell, move)
+
+def build_path():
+    cur, path, seen = START, [START], {START}
+    while cur != GOAL and len(path) < N * N:
+        cand, w = [], []
+        for k, (dr, dc) in enumerate(MOVES):
+            nxt = (cur[0]+dr, cur[1]+dc)
+            if free(nxt) and nxt not in seen:
+                eta = 1.0 / (dist(nxt, GOAL) + 1)        # goal-directed heuristic
+                cand.append((k, nxt)); w.append(tau[cur][k]**ALPHA * eta**BETA)
+        if not cand: return None, None                    # dead end -> ant fails
+        k, nxt = random.choices(cand, weights=w)[0]       # roulette-wheel choice
+        path.append(nxt); seen.add(nxt); cur = nxt
+    if cur != GOAL: return None, None
+    return path, sum(dist(path[i], path[i+1]) for i in range(len(path)-1))
+
+def move_index(a, b): return MOVES.index((b[0]-a[0], b[1]-a[1]))
+
+best_path, best_len, history = None, np.inf, []
+for it in range(N_ITER):
+    tours = [build_path() for _ in range(N_ANTS)]
+    tours = [(p, L) for p, L in tours if p]
+    tau *= (1 - RHO)                                      # evaporation
+    for p, L in tours:                                    # deposit
+        for i in range(len(p)-1):
+            tau[p[i]][move_index(p[i], p[i+1])] += Q / L
+        if L < best_len: best_path, best_len = p, L
+    if best_path:                                         # elitist reinforcement
+        for i in range(len(best_path)-1):
+            tau[best_path[i]][move_index(best_path[i], best_path[i+1])] += 2 * Q / best_len
+    history.append(best_len)
+print(f"[ACO] global path length = {best_len:.2f}  ({len(best_path)} cells)")
+
+# ---------------- PART 3: DYNAMIC OBSTACLES ----------------
+class Mover:
+    def __init__(self, pos, d): self.pos, self.d = pos, d
+    def step(self):
+        if random.random() < 0.2: self.d = random.choice(MOVES[:4])   # unknown motion rule
+        nxt = (self.pos[0]+self.d[0], self.pos[1]+self.d[1])
+        if free(nxt) and nxt not in (START, GOAL): self.pos = nxt
+        else: self.d = random.choice(MOVES[:4])
+
+movers = [Mover((10, 2), (0, 1)), Mover((17, 12), (-1, 0)), Mover((6, 16), (0, -1)),
+          Mover((14, 14), (1, 0)), Mover((2, 12), (1, 0))]
+
+# ---------------- PART 4: ROLLING WINDOW + TWO-LEVEL SAFETY ----------------
+D_DANGER, D_WARN, LOOKAHEAD = 2.0, 3.5, 3
+
+def rolling_step(robot, path, idx, recent):
+    idx = min(range(idx, min(idx + 4, len(path))), key=lambda i: dist(path[i], robot))
+    target = path[min(idx + LOOKAHEAD, len(path) - 1)]    # sub-goal inside the window
+    obs = [m.pos for m in movers]
+    best, best_score, fallback, fb_d = None, np.inf, robot, -1
+    for dr, dc in MOVES + [(0, 0)]:
+        c = (robot[0]+dr, robot[1]+dc)
+        if not free(c): continue
+        dmin = min(dist(c, o) for o in obs)
+        if dmin > fb_d: fallback, fb_d = c, dmin
+        if dmin < D_DANGER: continue                      # level 1: forbidden
+        score = dist(c, target)
+        if dmin < D_WARN: score += 3.0 * (D_WARN - dmin)  # level 2: soft penalty
+        if c in recent: score += 1.0                      # avoid oscillation
+        if score < best_score: best, best_score = c, score
+    return (best if best else fallback), idx
+
+robot, idx, recent = START, 0, []
+trajectory, collisions, steps = [robot], 0, 0
+while robot != GOAL and steps < 150:
+    steps += 1
+    robot, idx = rolling_step(robot, best_path, idx, recent[-4:])
+    recent.append(robot)
+    for m in movers: m.step()
+    if any(m.pos == robot for m in movers): collisions += 1
+    trajectory.append(robot)
+
+print(f"[Rolling window] reached goal = {robot == GOAL}, steps = {steps}, collisions = {collisions}")
+print(f"Total time: {time.time()-t0:.2f} s")
+
+# ---------------- PART 5: PLOTS ----------------
+fig, ax = plt.subplots(1, 2, figsize=(11, 4.5))
+ax[0].plot(history, marker="o"); ax[0].set_title("ACO convergence")
+ax[0].set_xlabel("Iteration"); ax[0].set_ylabel("Best path length"); ax[0].grid(True)
+ax[1].imshow(grid, cmap="Greys")
+ax[1].plot(*zip(*[(c, r) for r, c in best_path]), "b--", label="ACO global path")
+ax[1].plot(*zip(*[(c, r) for r, c in trajectory]), "r-", label="Actual trajectory")
+ax[1].scatter(*zip(*[(m.pos[1], m.pos[0]) for m in movers]), c="orange", marker="s", label="Moving obstacles (end)")
+ax[1].scatter([0, N-1], [0, N-1], c=["green", "purple"], s=80, zorder=5)
+ax[1].set_title("Global path vs. rolling-window trajectory"); ax[1].legend(fontsize=7)
+plt.tight_layout()
+plt.show()                                # shows the graphs
+# plt.savefig("raco_demo.png", dpi=110)   # optional: uncomment to also save the image
