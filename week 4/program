@@ -1,0 +1,101 @@
+import numpy as np, time
+from math import gamma, sin, pi
+import matplotlib.pyplot as plt
+
+t0 = time.time()
+
+# ---------------- PART 1: BENCHMARK FUNCTIONS (minimise, optimum = 0) ----------------
+def sphere(x):    return np.sum(x**2)
+def rastrigin(x): return 10*len(x) + np.sum(x**2 - 10*np.cos(2*pi*x))
+def ackley(x):    return (-20*np.exp(-0.2*np.sqrt(np.mean(x**2)))
+                          - np.exp(np.mean(np.cos(2*pi*x))) + 20 + np.e)
+FUNCS = {"Sphere": (sphere, 5.12), "Rastrigin": (rastrigin, 5.12), "Ackley": (ackley, 32.0)}
+
+D, N_NESTS, MAX_ITER = 10, 25, 300            # dimensions, population, iterations
+
+# ---------------- PART 2: LEVY FLIGHT (heavy-tailed random step) ----------------
+def levy(size, beta=1.5):
+    s = (gamma(1+beta)*sin(pi*beta/2) / (gamma((1+beta)/2)*beta*2**((beta-1)/2)))**(1/beta)
+    u, v = np.random.randn(*size)*s, np.random.randn(*size)
+    return u / np.abs(v)**(1/beta)
+
+# ---------------- PART 3: STANDARD CUCKOO SEARCH ----------------
+def standard_cs(f, bound, seed, pa=0.25, alpha=0.01):
+    np.random.seed(seed)
+    nests = np.random.uniform(-bound, bound, (N_NESTS, D))
+    fit = np.array([f(n) for n in nests])
+    hist = []
+    for _ in range(MAX_ITER):
+        best = nests[np.argmin(fit)]
+        # (a) new cuckoo = Levy flight around each nest, biased toward the best nest
+        new = np.clip(nests + alpha*levy((N_NESTS, D))*(nests - best), -bound, bound)
+        nf = np.array([f(n) for n in new])
+        better = nf < fit
+        nests[better], fit[better] = new[better], nf[better]
+        # (b) abandon a fraction pa of the worst nests, replace by random walks
+        mask = np.random.rand(N_NESTS, D) < pa
+        step = np.random.rand() * (nests[np.random.permutation(N_NESTS)] - nests[np.random.permutation(N_NESTS)])
+        new = np.clip(nests + step*mask, -bound, bound)
+        nf = np.array([f(n) for n in new])
+        better = nf < fit
+        nests[better], fit[better] = new[better], nf[better]
+        hist.append(fit.min())
+    return hist
+
+# ---------------- PART 4: MULTI-STRATEGY ADAPTIVE CUCKOO SEARCH (simplified) ----------------
+def ms_adaptive_cs(f, bound, seed):
+    np.random.seed(seed)
+    nests = np.random.uniform(-bound, bound, (N_NESTS, D))
+    fit = np.array([f(n) for n in nests])
+    K = 3                                         # number of search strategies
+    prob = np.ones(K) / K                         # strategy-selection probabilities (adaptive)
+    pa_mean = 0.25                                # abandon-rate (adaptive)
+    hist = []
+    for t in range(MAX_ITER):
+        best = nests[np.argmin(fit)].copy()
+        succ, used = np.ones(K)*0.1, np.ones(K)*0.1   # success counters per strategy
+        pa_good = []
+        for i in range(N_NESTS):
+            k = np.random.choice(K, p=prob)           # pick a strategy for this cuckoo
+            r1, r2 = np.random.choice(N_NESTS, 2, replace=False)
+            if k == 0:   # strategy 0: Levy flight around own nest (explore)
+                cand = nests[i] + 0.05*bound*levy((D,))*np.random.randn(D)*(1 - t/MAX_ITER)
+            elif k == 1: # strategy 1: Levy flight toward the best nest (exploit)
+                cand = nests[i] + np.random.rand()*(best - nests[i]) + 0.01*levy((D,))*bound*(1 - t/MAX_ITER)
+            else:        # strategy 2: difference of two random nests (diversity)
+                cand = nests[i] + np.random.rand()*(nests[r1] - nests[r2])
+            cand = np.clip(cand, -bound, bound)
+            fc = f(cand); used[k] += 1
+            if fc < fit[i]:
+                nests[i], fit[i] = cand, fc; succ[k] += 1   # reward the strategy that worked
+        # adapt strategy probabilities from their success rates (keep a floor of 0.2 so no strategy dies)
+        rate = succ / used
+        prob = np.maximum(rate / rate.sum(), 0.2); prob /= prob.sum()
+        # abandon worst nests with an adaptive rate pa ~ N(pa_mean, 0.1)
+        pa = np.clip(np.random.normal(pa_mean, 0.1), 0.05, 0.5)
+        n_ab = max(1, int(pa * N_NESTS))
+        for i in np.argsort(fit)[-n_ab:]:
+            cand = np.random.uniform(-bound, bound, D)
+            fc = f(cand)
+            if fc < fit[i]: nests[i], fit[i] = cand, fc; pa_good.append(pa)
+        if pa_good: pa_mean = 0.9*pa_mean + 0.1*np.mean(pa_good)   # learn good pa values
+        hist.append(fit.min())
+    return hist, prob
+
+# ---------------- PART 5: RUN + COMPARE (5 runs each) ----------------
+RUNS = 5
+fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+print(f"{'Function':10s} | {'Standard CS':>14s} | {'Adaptive CS':>14s}")
+for ax, (name, (f, b)) in zip(axes, FUNCS.items()):
+    std = np.array([standard_cs(f, b, s) for s in range(RUNS)])
+    ada_runs = [ms_adaptive_cs(f, b, s) for s in range(RUNS)]
+    ada = np.array([h for h, _ in ada_runs])
+    print(f"{name:10s} | {std[:, -1].mean():14.4e} | {ada[:, -1].mean():14.4e}")
+    ax.semilogy(std.mean(0), label="Standard CS")
+    ax.semilogy(ada.mean(0), label="Multi-strategy adaptive CS")
+    ax.set_title(name); ax.set_xlabel("Iteration"); ax.set_ylabel("Best fitness (log)")
+    ax.grid(True); ax.legend(fontsize=7)
+print("Final strategy probabilities (Levy-explore, toward-best, random-diff):", np.round(ada_runs[-1][1], 2))
+print(f"Total time: {time.time()-t0:.1f} s")
+plt.tight_layout()
+plt.show()
