@@ -1,0 +1,242 @@
+import numpy as np, time, random, warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning)   # empty driver types in single-type runs
+import matplotlib.pyplot as plt
+
+t_start = time.time()
+
+# =====================================================================
+# PART 1: SETTINGS  (three driver types, as in the paper's "different driver behaviour")
+# =====================================================================
+TYPES   = ["Cautious", "Normal", "Aggressive"]
+VMAX    = np.array([4, 5, 6])              # top speed (cells per step)
+P_SLOW  = np.array([0.20, 0.25, 0.15])     # random slow-down probability
+BACK    = np.array([6, 4, 2])              # free cells needed BEHIND before changing lane
+MIX     = np.array([0.3, 0.5, 0.2])        # share of each driver type in "mixed" traffic
+
+# =====================================================================
+# PART 2: THE ROAD  (a ring road, several lanes, optional traffic light)
+# Every method works on WHOLE ARRAYS, so all cars are updated at once
+# from the same old state = synchronous / parallel-style update.
+# =====================================================================
+class Road:
+    def __init__(self, L=400, lanes=3, density=0.2, mix=MIX, light=None, seed=0):
+        self.L, self.lanes, self.light = L, lanes, light
+        self.rng = np.random.default_rng(seed)
+        n = int(density * L * lanes)
+        cells = self.rng.choice(L * lanes, n, replace=False)       # random start cells
+        self.pos, self.lane = cells % L, cells // L
+        self.typ = self.rng.choice(3, n, p=mix)                    # driver type per car
+        self.v = np.zeros(n, int)
+        self.t, self.changes, self.passed = 0, 0, 0
+
+    # ---- helper: free cells to the car in front, in the SAME lane ----
+    def gap_ahead(self, pos, lane):
+        g = np.empty(len(pos), int)
+        for l in range(self.lanes):
+            idx = np.where(lane == l)[0]
+            if len(idx) == 0: continue
+            order = idx[np.argsort(pos[idx])]
+            p = pos[order]
+            gg = (np.roll(p, -1) - p - 1) % self.L
+            if len(idx) == 1: gg[:] = self.L - 1
+            g[order] = gg
+        return g
+
+    # ---- helper: free cells ahead/behind a query position inside another lane ----
+    def gaps_in_lane(self, p_query, sorted_lane):
+        s, L = sorted_lane, self.L
+        if len(s) == 0:
+            return np.full(len(p_query), L), np.full(len(p_query), L), np.zeros(len(p_query), bool)
+        k = np.searchsorted(s, p_query, side="left")
+        ahead, behind = s[k % len(s)], s[(k - 1) % len(s)]
+        return (ahead - p_query - 1) % L, (p_query - behind - 1) % L, (ahead == p_query)
+
+    # ---- helper: can each car move one lane left (-1) / right (+1) safely? ----
+    def target_info(self, d, sorted_lanes):
+        n = len(self.pos)
+        tl = self.lane + d
+        valid = (tl >= 0) & (tl < self.lanes)
+        ahead, back, occ = np.zeros(n, int), np.zeros(n, int), np.ones(n, bool)
+        for l in range(self.lanes):
+            m = valid & (tl == l)
+            if m.any():
+                ahead[m], back[m], occ[m] = self.gaps_in_lane(self.pos[m], sorted_lanes[l])
+        safe = valid & ~occ & (back >= BACK[self.typ]) & (ahead >= 2)
+        return tl, ahead, safe
+
+    def light_is_red(self):
+        if self.light is None: return False
+        cycle = self.light["green"] + self.light["red"]
+        return (self.t % cycle) >= self.light["green"]
+
+    # =================== ONE TIME STEP ===================
+    def step(self):
+        L, rng, n = self.L, self.rng, len(self.pos)
+        pos, lane, v, typ = self.pos, self.lane, self.v, self.typ
+
+        # ---- (a) LANE CHANGE: all cars decide from the same old state ----
+        sorted_lanes = [np.sort(pos[lane == l]) for l in range(self.lanes)]
+        g_here = self.gap_ahead(pos, lane)
+        tl_l, ah_l, s_l = self.target_info(-1, sorted_lanes)
+        tl_r, ah_r, s_r = self.target_info(+1, sorted_lanes)
+        use_left = s_l & (~s_r | (ah_l > ah_r) | ((ah_l == ah_r) & (rng.random(n) < 0.5)))
+        use_right = s_r & ~use_left
+        target = np.where(use_left, tl_l, tl_r)
+        ahead_t = np.where(use_left, ah_l, ah_r)
+        blocked = g_here < np.minimum(v + 1, VMAX[typ])             # I am held up
+        move = (use_left | use_right) & blocked & (ahead_t > g_here) & (rng.random(n) < 0.8)
+        cand = np.where(move)[0]                                    # conflict rule: one car per target cell
+        _, first = np.unique((target * L + pos)[cand], return_index=True)
+        ok = np.zeros(n, bool); ok[cand[first]] = True
+        lane = np.where(ok, target, lane)
+        self.changes += int(ok.sum())
+
+        # ---- (b) NaSch SPEED + MOVE on all cars at once ----
+        g = self.gap_ahead(pos, lane)
+        red = self.light_is_red()
+        if red and self.light is not None:                          # red light = wall at the light cell
+            g = np.minimum(g, (self.light["x"] - pos - 1) % L)
+        v = np.minimum(v + 1, VMAX[typ])                            # 1 accelerate
+        v = np.minimum(v, g)                                        # 2 brake (no collisions)
+        v = np.where((rng.random(n) < P_SLOW[typ]) & (v > 0), v - 1, v)   # 3 random slow-down
+        old = pos
+        pos = (pos + v) % L                                         # 4 move
+        if self.light is not None:                                  # count cars crossing the light
+            dist = (self.light["x"] - old) % L
+            self.passed += int(((dist >= 1) & (dist <= v)).sum())
+        self.pos, self.lane, self.v = pos, lane, v
+        self.t += 1
+
+# =====================================================================
+# PART 3: RUN ONE SIMULATION AND COLLECT STATISTICS
+# =====================================================================
+def simulate(density, mix=MIX, steps=300, warm=100, light=None, record=0, seed=0, lanes=3, L=400):
+    road = Road(L, lanes, density, mix, light, seed)
+    flow, sp, sp_type, vsamp, st = [], [], [], [], []
+    for t in range(steps):
+        road.step()
+        if t == warm: road.passed, road.changes = 0, 0
+        if t >= warm:
+            flow.append(road.v.mean() * density)                    # flow = mean speed x density
+            sp.append(road.v.mean())
+            sp_type.append([road.v[road.typ == k].mean() if (road.typ == k).any() else np.nan for k in range(3)])
+            if t % 10 == 0: vsamp.append(road.v.copy())
+        if record and t >= steps - record:
+            row = np.full(L, np.nan); m = road.lane == 0
+            row[road.pos[m]] = road.v[m]; st.append(row)
+    n_meas = steps - warm
+    return dict(flow=np.mean(flow), speed=np.mean(sp), speed_type=np.nanmean(sp_type, axis=0),
+                lc_rate=road.changes / n_meas / max(len(road.pos), 1) * 100,   # lane changes per 100 cars per step
+                throughput=road.passed / n_meas * 100,                          # cars through the light per 100 steps
+                vsamples=np.concatenate(vsamp), st=np.array(st))
+
+# =====================================================================
+# PART 4: EXPERIMENTS
+# =====================================================================
+dens = [0.03, 0.06, 0.10, 0.14, 0.18, 0.24, 0.32, 0.45, 0.60]
+mixes = {"All cautious": np.array([1., 0, 0]), "All normal": np.array([0, 1., 0]),
+         "All aggressive": np.array([0, 0, 1.]), "Mixed": MIX}
+
+print("Running experiment 1: flow vs density for different driver mixes ...")
+sweep = {name: [simulate(d, mix) for d in dens] for name, mix in mixes.items()}
+
+print("Running experiment 2: space-time diagrams ...")
+free   = simulate(0.20, record=150)                                            # no light
+lit    = simulate(0.12, light=dict(x=200, green=30, red=30), record=150)       # with light
+
+print("Running experiment 3: traffic-light green time ...")
+greens = [10, 20, 30, 45, 60, 90]
+thr = [simulate(0.12, light=dict(x=200, green=g, red=30), steps=400, warm=100)["throughput"] for g in greens]
+base = simulate(0.12, steps=400, warm=100, light=dict(x=200, green=1, red=0))["throughput"]   # light never red
+
+print("Running experiment 4: speed benchmark ...")
+def nasch_loop(n, L, steps, vmax=5, p=0.25):                                   # plain Python loops (one car at a time)
+    pos = sorted(random.sample(range(L), n)); v = [0] * n
+    for _ in range(steps):
+        for i in range(n):
+            gap = (pos[(i + 1) % n] - pos[i] - 1) % L
+            vi = min(min(v[i] + 1, vmax), gap)
+            if vi > 0 and random.random() < p: vi -= 1
+            v[i] = vi
+        pos = [(pos[i] + v[i]) % L for i in range(n)]
+sizes_loop = [200, 1000, 4000, 16000]
+sizes_vec  = [200, 1000, 4000, 16000, 64000]
+t_loop, t_vec = [], []
+for n in sizes_loop:
+    t = time.time(); nasch_loop(n, 5 * n, 20); t_loop.append((time.time() - t) / 20 * 1000)
+for n in sizes_vec:
+    r = Road(L=5 * n, lanes=1, density=0.2, seed=1); t = time.time()
+    for _ in range(20): r.step()
+    t_vec.append((time.time() - t) / 20 * 1000)
+
+# =====================================================================
+# PART 5: PRINTED SUMMARY
+# =====================================================================
+print("\n=== Peak flow per lane and the density where it happens ===")
+for name in mixes:
+    fl = [r["flow"] for r in sweep[name]]; i = int(np.argmax(fl))
+    print(f"{name:15s}: peak flow = {fl[i]:.3f} cars/step at density {dens[i]:.2f}")
+print("\n=== Mixed traffic at density 0.18: mean speed per driver type ===")
+i = dens.index(0.18)
+for k, name in enumerate(TYPES):
+    print(f"{name:11s}: {sweep['Mixed'][i]['speed_type'][k]:.2f} cells/step")
+print(f"\nTraffic light (green 30 / red 30): {lit['throughput']:.1f} cars per 100 steps pass the light")
+print(f"Light never red (baseline):        {base:.1f} cars per 100 steps")
+print("\n=== Speed benchmark (ms per time step, same density) ===")
+for n, t in zip(sizes_loop, t_loop):
+    j = sizes_vec.index(n)
+    print(f"{n:6d} cars: Python loop {t:8.2f} ms | vectorized {t_vec[j]:6.2f} ms | speed-up x{t / t_vec[j]:.0f}")
+print(f"{sizes_vec[-1]:6d} cars: vectorized {t_vec[-1]:.2f} ms per step")
+print(f"\nTotal time: {time.time() - t_start:.1f} s")
+
+# =====================================================================
+# PART 6: GRAPHS
+# =====================================================================
+fig1, ax = plt.subplots(2, 3, figsize=(16, 8.5))
+fig1.suptitle("Multi-lane cellular-automaton traffic simulation (3 lanes, ring road)", fontsize=13)
+
+for name in mixes:                                                              # 1 fundamental diagram
+    ax[0, 0].plot(dens, [r["flow"] for r in sweep[name]], "o-", label=name)
+ax[0, 0].set_title("Flow vs density (fundamental diagram)")
+ax[0, 0].set_xlabel("Density (cars per cell per lane)"); ax[0, 0].set_ylabel("Flow per lane (cars/step)")
+ax[0, 0].legend(fontsize=8); ax[0, 0].grid(True)
+
+for name in mixes:                                                              # 2 speed vs density
+    ax[0, 1].plot(dens, [r["speed"] for r in sweep[name]], "o-", label=name)
+ax[0, 1].set_title("Mean speed vs density"); ax[0, 1].set_xlabel("Density"); ax[0, 1].set_ylabel("Mean speed (cells/step)")
+ax[0, 1].legend(fontsize=8); ax[0, 1].grid(True)
+
+for k, name in enumerate(TYPES):                                                # 3 speed by driver type (mixed)
+    ax[0, 2].plot(dens, [r["speed_type"][k] for r in sweep["Mixed"]], "o-", label=name)
+ax[0, 2].set_title("Mixed traffic: speed by driver type"); ax[0, 2].set_xlabel("Density")
+ax[0, 2].set_ylabel("Mean speed (cells/step)"); ax[0, 2].legend(fontsize=8); ax[0, 2].grid(True)
+
+ax[1, 0].plot(dens, [r["lc_rate"] for r in sweep["Mixed"]], "s-", color="tab:red")  # 4 lane changes
+ax[1, 0].set_title("Lane changes (mixed traffic)"); ax[1, 0].set_xlabel("Density")
+ax[1, 0].set_ylabel("Lane changes per 100 cars per step"); ax[1, 0].grid(True)
+
+for d, c in [(0.10, "tab:green"), (0.24, "tab:orange"), (0.45, "tab:red")]:    # 5 speed histograms
+    ax[1, 1].hist(sweep["Mixed"][dens.index(d)]["vsamples"], bins=np.arange(-0.5, 7.5, 1),
+                  alpha=0.55, density=True, label=f"density {d}", color=c)
+ax[1, 1].set_title("Speed distribution (mixed traffic)"); ax[1, 1].set_xlabel("Speed (cells/step)")
+ax[1, 1].set_ylabel("Share of cars"); ax[1, 1].legend(fontsize=8)
+
+ax[1, 2].plot(greens, thr, "o-", label="Light, red = 30 steps")                # 6 traffic-light timing
+ax[1, 2].axhline(base, color="gray", ls="--", label="No red phase (baseline)")
+ax[1, 2].set_title("Traffic light: throughput vs green time"); ax[1, 2].set_xlabel("Green time (steps)")
+ax[1, 2].set_ylabel("Cars through light per 100 steps"); ax[1, 2].legend(fontsize=8); ax[1, 2].grid(True)
+fig1.tight_layout()
+
+fig2, bx = plt.subplots(1, 3, figsize=(16, 5), layout="constrained")
+cmap = plt.cm.RdYlGn.copy(); cmap.set_bad("white")
+for a, res, title in [(bx[0], free, "Space-time, lane 0, density 0.20\n(red streaks = jam waves moving backwards)"),
+                      (bx[1], lit, "Space-time, lane 0, with traffic light at x=200\n(green 30 / red 30)")]:
+    im = a.imshow(np.ma.masked_invalid(res["st"]), cmap=cmap, vmin=0, vmax=6, aspect="auto", interpolation="nearest")
+    a.set_title(title, fontsize=10); a.set_xlabel("Road position"); a.set_ylabel("Time (downwards)")
+bx[1].axvline(200, color="black", lw=1)
+fig2.colorbar(im, ax=bx[:2], label="Car speed (cells/step)", fraction=0.04)
+bx[2].loglog(sizes_loop, t_loop, "o-", label="Python loop")
+bx[2].loglog(sizes_vec, t_vec, "s-", label="Vectorized (all cars at once)")
+bx[2].set_title("Computation time per step"); bx[2].set_xlabel("Number of cars"); bx[2].set_ylabel("ms per step")
+bx[2].legend(); bx[2].grid(True, which="both", alpha=0.4)
+plt.show()
